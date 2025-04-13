@@ -19,7 +19,7 @@ std::string bytesToHex(const std::vector<BYTE>& bytes) {
 
 int main() {
     // Establish PC/SC context
-    std::cout << "app\n";
+    std::cout << "NFC File Receiver Application\n";
     SCARDCONTEXT hContext;
     LONG rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &hContext);
     if (rv != SCARD_S_SUCCESS) {
@@ -135,11 +135,61 @@ int main() {
 
     std::cout << "File size: " << fileSize << " bytes" << std::endl;
 
+    // Get file metadata (using INS_GET_FILE_METADATA)
+    BYTE getMetadataCmd[] = {
+        0x00, // CLA
+        0xB2, // INS (GET_FILE_METADATA)
+        0x00, // P1
+        0x00, // P2
+        0x00  // Le (get all available data)
+    };
+
+    BYTE metadataResponse[258];
+    DWORD metadataResponseLen = sizeof(metadataResponse);
+
+    rv = SCardTransmit(hCard, pioSendPci, getMetadataCmd, sizeof(getMetadataCmd),
+        NULL, metadataResponse, &metadataResponseLen);
+
+    std::string fileName = "received_file";
+    std::string fileExtension = ".bin";
+
+    if (rv == SCARD_S_SUCCESS && metadataResponseLen > 2) {
+        // Last two bytes are SW1SW2, metadata is everything before
+        int metadataLength = metadataResponseLen - 2;
+
+        if (metadataLength > 0) {
+            // Convert metadata bytes to string
+            std::string metadataStr(reinterpret_cast<char*>(metadataResponse), metadataLength);
+
+            // Split string by newline
+            size_t newlinePos = metadataStr.find('\n');
+            if (newlinePos != std::string::npos) {
+                fileName = metadataStr.substr(0, newlinePos);
+                fileExtension = metadataStr.substr(newlinePos + 1);
+
+                std::cout << "File metadata received" << std::endl;
+                std::cout << "  Original filename: " << fileName << std::endl;
+                std::cout << "  File extension: " << fileExtension << std::endl;
+            }
+        }
+    }
+    else {
+        std::cout << "Couldn't get file metadata, using default filename" << std::endl;
+    }
+
     // Generate output filename with timestamp
     std::time_t currentTime = std::time(nullptr);
     char timeStr[20];
     std::strftime(timeStr, sizeof(timeStr), "%Y%m%d_%H%M%S", std::localtime(&currentTime));
-    std::string outputFileName = "received_file_" + std::string(timeStr) + ".bin";
+
+    // Clean up filename by removing invalid characters
+    for (char& c : fileName) {
+        if (c == '\\' || c == '/' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
+            c = '_';
+        }
+    }
+
+    std::string outputFileName = fileName + "_" + std::string(timeStr) + fileExtension;
 
     // Open output file
     std::ofstream outputFile(outputFileName, std::ios::binary);
@@ -215,6 +265,30 @@ int main() {
 
         // Delay to prevent overwhelming the NFC interface
         Sleep(50);
+    }
+
+    // Get file checksum (optional verification)
+    BYTE getChecksumCmd[] = {
+        0x00, // CLA
+        0xB1, // INS (GET_CHECKSUM)
+        0x00, // P1
+        0x00, // P2
+        0x00  // Le (get all available bytes)
+    };
+
+    BYTE checksumResponse[258];
+    DWORD checksumResponseLen = sizeof(checksumResponse);
+
+    rv = SCardTransmit(hCard, pioSendPci, getChecksumCmd, sizeof(getChecksumCmd),
+        NULL, checksumResponse, &checksumResponseLen);
+
+    if (rv == SCARD_S_SUCCESS && checksumResponseLen > 2) {
+        // Last two bytes are SW1SW2, checksum is everything before
+        int checksumLength = checksumResponseLen - 2;
+        std::cout << "\nReceived MD5 checksum: "
+            << bytesToHex(std::vector<BYTE>(checksumResponse,
+                checksumResponse + checksumLength)) << std::endl;
+        // Here you could calculate MD5 of received file and compare
     }
 
     outputFile.close();
