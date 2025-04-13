@@ -3,10 +3,11 @@ package com.example.filetranferproject;
 import android.nfc.cardemulation.HostApduService;
 import android.os.Bundle;
 import android.util.Log;
-import android.widget.Toast;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileReader;
 import java.security.MessageDigest;
 
 public class MyHostApduService extends HostApduService {
@@ -17,15 +18,21 @@ public class MyHostApduService extends HostApduService {
     private byte[] fileData;
     private byte[] fileChecksum;
 
+    // Add variables for file metadata
+    private String originalFileName = "";
+    private String originalFileExtension = "";
+
     // Command instructions
     private static final byte INS_SELECT = (byte) 0xA4;
     private static final byte INS_READ_BINARY = (byte) 0xB0;
     private static final byte INS_GET_CHECKSUM = (byte) 0xB1;
+    private static final byte INS_GET_FILE_METADATA = (byte) 0xB2; // New instruction for file metadata
 
     @Override
     public void onCreate() {
         super.onCreate();
         loadFile();
+        loadFileMetadata();
     }
 
     private void loadFile() {
@@ -53,6 +60,26 @@ public class MyHostApduService extends HostApduService {
         }
     }
 
+    private void loadFileMetadata() {
+        try {
+            File metadataFile = new File(getFilesDir(), "file_metadata.txt");
+            if (!metadataFile.exists()) {
+                Log.e(TAG, "Metadata file not found");
+                return;
+            }
+
+            try (BufferedReader reader = new BufferedReader(new FileReader(metadataFile))) {
+                originalFileName = reader.readLine();
+                originalFileExtension = reader.readLine();
+
+                Log.i(TAG, "Loaded metadata: filename=" + originalFileName +
+                        ", extension=" + originalFileExtension);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error loading metadata: " + e.getMessage());
+        }
+    }
+
     @Override
     public byte[] processCommandApdu(byte[] apdu, Bundle extras) {
         if (apdu.length < 4) {
@@ -68,6 +95,8 @@ public class MyHostApduService extends HostApduService {
             return handleReadBinary(apdu);
         } else if (ins == INS_GET_CHECKSUM) {
             return handleGetChecksum();
+        } else if (ins == INS_GET_FILE_METADATA) {
+            return handleGetFileMetadata();
         }
 
         // Unsupported instruction
@@ -139,6 +168,23 @@ public class MyHostApduService extends HostApduService {
         response[fileChecksum.length + 1] = (byte) 0x00;
 
         Log.i(TAG, "Sending file checksum");
+        return response;
+    }
+
+    private byte[] handleGetFileMetadata() {
+        Log.i(TAG, "Metadata request received");
+
+        // Prepare metadata string (format: filename + '\n' + extension)
+        String metadata = originalFileName + "\n" + originalFileExtension;
+        byte[] metadataBytes = metadata.getBytes();
+
+        // Prepare response: metadata + status bytes
+        byte[] response = new byte[metadataBytes.length + 2];
+        System.arraycopy(metadataBytes, 0, response, 0, metadataBytes.length);
+        response[metadataBytes.length] = (byte) 0x90;
+        response[metadataBytes.length + 1] = (byte) 0x00;
+
+        Log.i(TAG, "Sending file metadata: " + metadata);
         return response;
     }
 

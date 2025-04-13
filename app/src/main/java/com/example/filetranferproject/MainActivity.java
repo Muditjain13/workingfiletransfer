@@ -3,10 +3,12 @@ package com.example.filetranferproject;
 import android.app.Activity;
 import android.content.ComponentName;
 import android.content.Intent;
+import android.database.Cursor;
 import android.net.Uri;
 import android.nfc.NfcAdapter;
 import android.nfc.cardemulation.CardEmulation;
 import android.os.Bundle;
+import android.provider.OpenableColumns;
 import android.util.Log;
 import android.widget.Button;
 import android.widget.TextView;
@@ -29,6 +31,10 @@ public class MainActivity extends AppCompatActivity {
     private Button selectFileButton;
     private NfcAdapter nfcAdapter;
     private File copiedFile;
+
+    // Add variables to store original file name and extension
+    private String originalFileName;
+    private String originalFileExtension;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -106,6 +112,17 @@ public class MainActivity extends AppCompatActivity {
             Uri selectedFileUri = data.getData();
 
             try {
+                // Get original file name and extension
+                originalFileName = getFileName(selectedFileUri);
+                originalFileExtension = getFileExtension(originalFileName);
+
+                // Store file metadata for the service to access
+                File metadataFile = new File(getFilesDir(), "file_metadata.txt");
+                try (FileOutputStream out = new FileOutputStream(metadataFile)) {
+                    String metadata = originalFileName + "\n" + originalFileExtension;
+                    out.write(metadata.getBytes());
+                }
+
                 // Copy file to internal storage
                 copiedFile = new File(getFilesDir(), "file_to_send.bin");
 
@@ -125,16 +142,54 @@ public class MainActivity extends AppCompatActivity {
                         totalCopied += length;
                     }
 
-                    fileInfoText.setText("File ready: " + copiedFile.getName() +
-                            "\nSize: " + copiedFile.length() + " bytes");
+                    fileInfoText.setText("File ready: " + originalFileName +
+                            "\nSize: " + copiedFile.length() + " bytes" +
+                            "\nExtension: " + originalFileExtension);
                     Toast.makeText(this, "File ready for transfer", Toast.LENGTH_SHORT).show();
 
                     Log.i(TAG, "Copied " + totalCopied + " bytes to " + copiedFile.getAbsolutePath());
+                    Log.i(TAG, "Original filename: " + originalFileName + ", Extension: " + originalFileExtension);
                 }
             } catch (Exception e) {
                 Log.e(TAG, "File copy error: " + e.getMessage());
                 Toast.makeText(this, "Error preparing file: " + e.getMessage(), Toast.LENGTH_SHORT).show();
             }
+        }
+    }
+
+    // Helper method to get file name from URI
+    private String getFileName(Uri uri) {
+        String result = null;
+        if (uri.getScheme().equals("content")) {
+            try (Cursor cursor = getContentResolver().query(uri, null, null, null, null)) {
+                if (cursor != null && cursor.moveToFirst()) {
+                    int nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                    if (nameIndex >= 0) {
+                        result = cursor.getString(nameIndex);
+                    }
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Error getting filename", e);
+            }
+        }
+        if (result == null) {
+            result = uri.getPath();
+            int cut = result.lastIndexOf('/');
+            if (cut != -1) {
+                result = result.substring(cut + 1);
+            }
+        }
+        return result;
+    }
+
+    // Helper method to get file extension
+    private String getFileExtension(String fileName) {
+        if (fileName == null) return "";
+        int lastDot = fileName.lastIndexOf('.');
+        if (lastDot >= 0) {
+            return fileName.substring(lastDot);
+        } else {
+            return "";
         }
     }
 
