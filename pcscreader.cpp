@@ -5,21 +5,121 @@
 #include <string>
 #include <Windows.h>
 #include <ctime>
+#include <iomanip>
+#include <sstream>
+#include <wincrypt.h> // For MD5 checksum calculation
 
 // Helper function to print bytes in hex format
 std::string bytesToHex(const std::vector<BYTE>& bytes) {
     std::string result;
-    char hex[3];
+    char hex[3];  // Buffer size reduced to 3 (2 hex chars + null terminator)
     for (BYTE b : bytes) {
-        sprintf_s(hex, "%02X ", b);
+        sprintf_s(hex, "%02X", b);  // FIXED: Removed space after each byte
         result += hex;
     }
     return result;
 }
 
+// Calculate MD5 checksum of a buffer (to match Android's implementation)
+std::vector<BYTE> calculateMD5Buffer(const std::vector<char>& buffer) {
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+    std::vector<BYTE> hashValue;
+
+    try {
+        // Initialize cryptography provider
+        if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+            throw std::runtime_error("CryptAcquireContext failed");
+        }
+
+        // Create hash object
+        if (!CryptCreateHash(hProv, CALG_MD5, 0, 0, &hHash)) {
+            throw std::runtime_error("CryptCreateHash failed");
+        }
+
+        // Add data to hash
+        if (!CryptHashData(hHash,
+            reinterpret_cast<BYTE*>(const_cast<char*>(buffer.data())),
+            static_cast<DWORD>(buffer.size()),
+            0)) {
+            throw std::runtime_error("CryptHashData failed");
+        }
+
+        // Get hash value
+        DWORD hashSize = 0;
+        DWORD hashSizeSize = sizeof(DWORD);
+        if (!CryptGetHashParam(hHash, HP_HASHSIZE, (BYTE*)&hashSize, &hashSizeSize, 0)) {
+            throw std::runtime_error("CryptGetHashParam HP_HASHSIZE failed");
+        }
+
+        hashValue.resize(hashSize);
+        if (!CryptGetHashParam(hHash, HP_HASHVAL, hashValue.data(), &hashSize, 0)) {
+            throw std::runtime_error("CryptGetHashParam HP_HASHVAL failed");
+        }
+
+        // Clean up
+        if (hHash) CryptDestroyHash(hHash);
+        if (hProv) CryptReleaseContext(hProv, 0);
+
+        return hashValue;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Error calculating MD5: " << e.what() << std::endl;
+
+        // Clean up on error
+        if (hHash) CryptDestroyHash(hHash);
+        if (hProv) CryptReleaseContext(hProv, 0);
+
+        return std::vector<BYTE>();
+    }
+}
+
+// Function to read entire file into memory and calculate MD5 (to match Android implementation)
+std::vector<BYTE> calculateMD5(const std::string& filename) {
+    try {
+        // Open file
+        std::ifstream file(filename, std::ios::binary);
+        if (!file.is_open()) {
+            throw std::runtime_error("Unable to open file for MD5 calculation");
+        }
+
+        // Get file size
+        file.seekg(0, std::ios::end);
+        std::streamsize fileSize = file.tellg();
+        file.seekg(0, std::ios::beg);
+
+        // Read entire file into memory at once (matching Android implementation)
+        std::vector<char> buffer(fileSize);
+        if (!file.read(buffer.data(), fileSize)) {
+            throw std::runtime_error("Failed to read file for MD5 calculation");
+        }
+
+        // Calculate MD5 on the entire file buffer
+        return calculateMD5Buffer(buffer);
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Error in calculateMD5: " << e.what() << std::endl;
+        return std::vector<BYTE>();
+    }
+}
+
+// New function to compare two MD5 hashes
+bool compareMD5(const std::vector<BYTE>& hash1, const std::vector<BYTE>& hash2) {
+    if (hash1.size() != hash2.size()) return false;
+
+    for (size_t i = 0; i < hash1.size(); i++) {
+        if (hash1[i] != hash2[i]) return false;
+    }
+
+    return true;
+}
+
 int main() {
     // Establish PC/SC context
     std::cout << "NFC File Receiver Application\n";
+    std::ofstream checksumLogFile("packet_checksums.txt", std::ios::trunc);
+    checksumLogFile << "Starting log ";
+
     SCARDCONTEXT hContext;
     LONG rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &hContext);
     if (rv != SCARD_S_SUCCESS) {
@@ -47,6 +147,7 @@ int main() {
     // Display available readers and use first one
     wchar_t* readerName = readers.data();
     int readerCount = 0;
+    
     while (*readerName != L'\0') {
         std::wcout << L"Reader " << readerCount++ << L": " << readerName << std::endl;
         readerName += wcslen(readerName) + 1;
@@ -177,11 +278,6 @@ int main() {
         std::cout << "Couldn't get file metadata, using default filename" << std::endl;
     }
 
-    // Generate output filename with timestamp
-    std::time_t currentTime = std::time(nullptr);
-    char timeStr[20];
-    std::strftime(timeStr, sizeof(timeStr), "%Y%m%d_%H%M%S", std::localtime(&currentTime));
-
     // Clean up filename by removing invalid characters
     for (char& c : fileName) {
         if (c == '\\' || c == '/' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
@@ -189,10 +285,12 @@ int main() {
         }
     }
 
-    std::string outputFileName = fileName + "_" + std::string(timeStr) + fileExtension;
+    // Create final filename - use the original name with extension
+    std::string outputFileName = fileName + fileExtension;
+    std::string tempFileName = outputFileName + ".temp";
 
-    // Open output file
-    std::ofstream outputFile(outputFileName, std::ios::binary);
+    // Open temporary output file
+    std::ofstream outputFile(tempFileName, std::ios::binary);
     if (!outputFile.is_open()) {
         std::cerr << "Failed to open output file" << std::endl;
         SCardDisconnect(hCard, SCARD_LEAVE_CARD);
@@ -212,6 +310,9 @@ int main() {
         0x00, // P2 (Offset LSB)
         maxChunkSize // Le (Expected response length)
     };
+
+    // Create a buffer to store the entire file data (to match Android implementation)
+    std::vector<char> fileBuffer(fileSize);
 
     // Receive file in chunks
     while (totalReceived < fileSize) {
@@ -246,11 +347,27 @@ int main() {
         BYTE dataSw2 = dataResponse[dataResponseLen - 1];
 
         if (dataSw1 == 0x90 && dataSw2 == 0x00) {
-            // Write data to file (excluding SW1SW2)
-            int chunkSize = dataResponseLen - 2;
-            outputFile.write(reinterpret_cast<char*>(dataResponse), chunkSize);
+            // Calculate actual data size (excluding SW1SW2)
+            int dataSize = dataResponseLen - 2;  // Exclude status bytes
+            int bytesToWrite = (dataSize < remaining) ? dataSize : remaining;
 
-            totalReceived += chunkSize;
+            // Write data to file and buffer WITHOUT including status bytes
+            outputFile.write(reinterpret_cast<char*>(dataResponse), bytesToWrite);
+
+            // Copy to in-memory buffer ONLY the actual data (not status bytes)
+
+            std::memcpy(&fileBuffer[totalReceived], dataResponse, bytesToWrite);
+
+            // Update the received count with the actual bytes written
+            totalReceived += bytesToWrite;
+            std::vector<char> packetBuffer(dataResponse, dataResponse + bytesToWrite);
+            std::vector<BYTE> packetChecksum = calculateMD5Buffer(packetBuffer);
+            // Inside the packet receiving loop
+
+
+// Log checksum to file
+checksumLogFile << "Packet " << ceil(totalReceived / maxChunkSize) << ": " << bytesToHex(packetChecksum) << std::endl;
+
 
             // Display progress
             int progressPercent = (totalReceived * 100) / fileSize;
@@ -263,21 +380,37 @@ int main() {
             break;
         }
 
-        // Delay to prevent overwhelming the NFC interface
+        // Small delay to prevent overwhelming the NFC interface
         Sleep(50);
     }
 
-    // Get file checksum (optional verification)
+    // Close the output file to ensure all data is written
+    outputFile.close();
+
+    // Final report - use exact match for completion check
+    std::cout << std::endl << "Final fileSize: " << fileSize
+        << ", totalReceived: " << totalReceived
+        << ", discrepancy: " << (fileSize - totalReceived) << std::endl;
+
+    bool transferComplete = (totalReceived == fileSize);
+    std::cout << "File reception "
+        << (transferComplete ? "completed successfully" : "incomplete")
+        << ": " << totalReceived << " of " << fileSize << " bytes received" << std::endl;
+
+    // Get file checksum from sender
     BYTE getChecksumCmd[] = {
-        0x00, // CLA
-        0xB1, // INS (GET_CHECKSUM)
-        0x00, // P1
-        0x00, // P2
-        0x00  // Le (get all available bytes)
+    0x00, // CLA
+    0xB1, // INS (GET_CHECKSUM)
+    0x00, // P1
+    0x00, // P2
+    0x00  // Le (get all available bytes)
     };
 
     BYTE checksumResponse[258];
     DWORD checksumResponseLen = sizeof(checksumResponse);
+
+    std::vector<BYTE> receivedChecksum;
+    bool checksumVerified = false;
 
     rv = SCardTransmit(hCard, pioSendPci, getChecksumCmd, sizeof(getChecksumCmd),
         NULL, checksumResponse, &checksumResponseLen);
@@ -285,17 +418,82 @@ int main() {
     if (rv == SCARD_S_SUCCESS && checksumResponseLen > 2) {
         // Last two bytes are SW1SW2, checksum is everything before
         int checksumLength = checksumResponseLen - 2;
-        std::cout << "\nReceived MD5 checksum: "
-            << bytesToHex(std::vector<BYTE>(checksumResponse,
-                checksumResponse + checksumLength)) << std::endl;
-        // Here you could calculate MD5 of received file and compare
+        receivedChecksum.assign(checksumResponse, checksumResponse + checksumLength);
+
+        // Get hex string of received checksum (without spaces)
+        std::string receivedHexStr = bytesToHex(receivedChecksum);
+        std::cout << "Received MD5 checksum: " << receivedHexStr << std::endl;
+
+        // Calculate MD5 from our buffer
+        std::vector<char> actualBuffer(fileBuffer.begin(), fileBuffer.begin() + totalReceived);
+        std::vector<BYTE> calculatedChecksumFromBuffer = calculateMD5Buffer(actualBuffer);
+        std::string calculatedHexStr = bytesToHex(calculatedChecksumFromBuffer);
+
+        std::cout << "Calculated MD5 checksum: " << calculatedHexStr << std::endl;
+
+        // Also calculate from file as a backup check
+        std::vector<BYTE> calculatedChecksumFromFile = calculateMD5(tempFileName);
+        std::string fileHexStr = bytesToHex(calculatedChecksumFromFile);
+
+        // IMPORTANT: Compare string representations (case-insensitive)
+        auto caseInsensitiveCompare = [](const std::string& a, const std::string& b) {
+            if (a.length() != b.length()) return false;
+            for (size_t i = 0; i < a.length(); i++) {
+                if (toupper(a[i]) != toupper(b[i])) return false;
+            }
+            return true;
+            };
+
+        // Try matching with and without spaces
+        checksumVerified = caseInsensitiveCompare(receivedHexStr, calculatedHexStr);
+
+        // If still not matching, try normalizing both strings (remove all spaces)
+        if (!checksumVerified) {
+            std::string normalizedReceived = receivedHexStr;
+            std::string normalizedCalculated = calculatedHexStr;
+
+            // Remove any spaces
+            normalizedReceived.erase(std::remove(normalizedReceived.begin(), normalizedReceived.end(), ' '), normalizedReceived.end());
+            normalizedCalculated.erase(std::remove(normalizedCalculated.begin(), normalizedCalculated.end(), ' '), normalizedCalculated.end());
+
+            std::cout << "Normalized checksums for comparison:" << std::endl;
+            std::cout << "  Received : " << normalizedReceived << std::endl;
+            std::cout << "  Calculated: " << normalizedCalculated << std::endl;
+
+            checksumVerified = caseInsensitiveCompare(normalizedReceived, normalizedCalculated);
+        }
+
+        std::cout << "Checksum verification: " << (checksumVerified ? "PASSED" : "FAILED") << std::endl;
+
+        // If checksum verification still fails, add an error message with possible causes
+        if (!checksumVerified) {
+            std::cout << "\nPossible causes of checksum mismatch:" << std::endl;
+            std::cout << "1. Data corruption during transfer" << std::endl;
+            std::cout << "2. Different MD5 implementation between Android and Windows" << std::endl;
+            std::cout << "3. Incorrect byte handling in the transfer process" << std::endl;
+        }
+    }
+    else {
+        std::cout << "Could not retrieve checksum from sender" << std::endl;
     }
 
-    outputFile.close();
-    std::cout << std::endl << "File reception "
-        << (totalReceived == fileSize ? "completed successfully" : "incomplete")
-        << ": " << totalReceived << " of " << fileSize << " bytes received" << std::endl;
-    std::cout << "Saved to: " << outputFileName << std::endl;
+    // Despite checksum failure, if file size matches, offer option to use file anyway
+    if (transferComplete && !checksumVerified) {
+        std::cout << "\nFile size is correct but checksum failed." << std::endl;
+        std::cout << "Do you want to use the file anyway? (y/n): ";
+        char response;
+        std::cin >> response;
+
+        if (response == 'y' || response == 'Y') {
+            // Rename temp file to final filename
+            if (std::rename(tempFileName.c_str(), outputFileName.c_str()) != 0) {
+                std::cerr << "Error moving temporary file to final location" << std::endl;
+            }
+            else {
+                std::cout << "File saved despite checksum mismatch: " << outputFileName << std::endl;
+            }
+        }
+    }
 
     // Clean up
     SCardDisconnect(hCard, SCARD_LEAVE_CARD);
